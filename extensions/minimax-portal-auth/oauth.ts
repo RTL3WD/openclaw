@@ -2,16 +2,39 @@ import { createHash, randomBytes, randomUUID } from "node:crypto";
 
 export type MiniMaxRegion = "cn" | "global";
 
+const CLIENT_ID_ENV_KEYS = {
+  cn: ["OPENCLAW_MINIMAX_OAUTH_CLIENT_ID_CN", "MINIMAX_OAUTH_CLIENT_ID_CN"],
+  global: ["OPENCLAW_MINIMAX_OAUTH_CLIENT_ID_GLOBAL", "MINIMAX_OAUTH_CLIENT_ID_GLOBAL"],
+} as const;
+
+// Default client IDs (fallback when environment variables are not set)
+const DEFAULT_CLIENT_IDS = {
+  cn: "78257093-7e40-4613-99e0-527b14b39113",
+  global: "78257093-7e40-4613-99e0-527b14b39113",
+} as const;
+
 const MINIMAX_OAUTH_CONFIG = {
   cn: {
     baseUrl: "https://api.minimaxi.com",
-    clientId: "78257093-7e40-4613-99e0-527b14b39113",
   },
   global: {
     baseUrl: "https://api.minimax.io",
-    clientId: "78257093-7e40-4613-99e0-527b14b39113",
   },
 } as const;
+
+function resolveEnv(keys: readonly string[]): string | undefined {
+  for (const key of keys) {
+    const value = process.env[key]?.trim();
+    if (value) {
+      return value;
+    }
+  }
+  return undefined;
+}
+
+function getClientId(region: MiniMaxRegion): string {
+  return resolveEnv(CLIENT_ID_ENV_KEYS[region]) ?? DEFAULT_CLIENT_IDS[region];
+}
 
 const MINIMAX_OAUTH_SCOPE = "group_id profile model.completion";
 const MINIMAX_OAUTH_GRANT_TYPE = "urn:ietf:params:oauth:grant-type:user_code";
@@ -21,7 +44,7 @@ function getOAuthEndpoints(region: MiniMaxRegion) {
   return {
     codeEndpoint: `${config.baseUrl}/oauth/code`,
     tokenEndpoint: `${config.baseUrl}/oauth/token`,
-    clientId: config.clientId,
+    clientId: getClientId(region),
     baseUrl: config.baseUrl,
   };
 }
