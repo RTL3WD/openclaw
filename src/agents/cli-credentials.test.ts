@@ -122,6 +122,92 @@ describe("cli credentials", () => {
     expect(passwordValue).toContain(backtickPayload);
   });
 
+  it("prevents command injection when reading Claude keychain credentials", async () => {
+    execFileSyncMock.mockImplementation((file: unknown, args: unknown) => {
+      const binary = String(file);
+      const argv = Array.isArray(args) ? args.map(String) : [];
+
+      // Verify that execFileSync is called with array args (no shell interpretation)
+      expect(binary).toBe("security");
+      expect(Array.isArray(args)).toBe(true);
+      expect(argv).toContain("find-generic-password");
+      expect(argv).toContain("-s");
+      expect(argv).toContain("Claude Code-credentials");
+      expect(argv).toContain("-w");
+
+      return JSON.stringify({
+        claudeAiOauth: {
+          accessToken: "test-access",
+          refreshToken: "test-refresh",
+          expiresAt: Date.now() + 60_000,
+        },
+      });
+    });
+
+    const { readClaudeCliCredentials } = await import("./cli-credentials.js");
+    const creds = readClaudeCliCredentials({
+      allowKeychainPrompt: true,
+      platform: "darwin",
+      execFileSync: execFileSyncMock,
+    });
+
+    expect(creds).toBeTruthy();
+    expect(creds?.type).toBe("oauth");
+    if (creds?.type === "oauth") {
+      expect(creds.access).toBe("test-access");
+      expect(creds.refresh).toBe("test-refresh");
+    }
+
+    // Verify execFileSync was called (not execSync)
+    expect(execFileSyncMock).toHaveBeenCalledTimes(1);
+  });
+
+  it("prevents command injection when reading Codex keychain with malicious account hash", async () => {
+    const tempHome = fs.mkdtempSync(path.join(os.tmpdir(), "openclaw-codex-"));
+    process.env.CODEX_HOME = tempHome;
+
+    execFileSyncMock.mockImplementation((file: unknown, args: unknown) => {
+      const binary = String(file);
+      const argv = Array.isArray(args) ? args.map(String) : [];
+
+      // Verify that execFileSync is called with array args (no shell interpretation)
+      expect(binary).toBe("security");
+      expect(Array.isArray(args)).toBe(true);
+      expect(argv).toContain("find-generic-password");
+      expect(argv).toContain("-s");
+      expect(argv).toContain("Codex Auth");
+      expect(argv).toContain("-a");
+      expect(argv).toContain("-w");
+
+      // Even if account hash contains shell metacharacters, they should not be interpreted
+      const accountArg = argv.find((arg) => arg.startsWith("cli|"));
+      expect(accountArg).toBeTruthy();
+
+      return JSON.stringify({
+        tokens: {
+          access_token: "keychain-access",
+          refresh_token: "keychain-refresh",
+        },
+        last_refresh: "2026-01-01T00:00:00Z",
+      });
+    });
+
+    const { readCodexCliCredentials } = await import("./cli-credentials.js");
+    const creds = readCodexCliCredentials({
+      platform: "darwin",
+      execFileSync: execFileSyncMock,
+    });
+
+    expect(creds).toMatchObject({
+      access: "keychain-access",
+      refresh: "keychain-refresh",
+      provider: "openai-codex",
+    });
+
+    // Verify execFileSync was called (not execSync)
+    expect(execFileSyncMock).toHaveBeenCalledTimes(1);
+  });
+
   it("falls back to the file store when the keychain update fails", async () => {
     const tempDir = fs.mkdtempSync(path.join(os.tmpdir(), "openclaw-"));
     const credPath = path.join(tempDir, ".claude", ".credentials.json");
@@ -177,7 +263,7 @@ describe("cli credentials", () => {
   });
 
   it("caches Claude Code CLI credentials within the TTL window", async () => {
-    execSyncMock.mockImplementation(() =>
+    execFileSyncMock.mockImplementation(() =>
       JSON.stringify({
         claudeAiOauth: {
           accessToken: "cached-access",
@@ -195,22 +281,22 @@ describe("cli credentials", () => {
       allowKeychainPrompt: true,
       ttlMs: 15 * 60 * 1000,
       platform: "darwin",
-      execSync: execSyncMock,
+      execFileSync: execFileSyncMock,
     });
     const second = readClaudeCliCredentialsCached({
       allowKeychainPrompt: false,
       ttlMs: 15 * 60 * 1000,
       platform: "darwin",
-      execSync: execSyncMock,
+      execFileSync: execFileSyncMock,
     });
 
     expect(first).toBeTruthy();
     expect(second).toEqual(first);
-    expect(execSyncMock).toHaveBeenCalledTimes(1);
+    expect(execFileSyncMock).toHaveBeenCalledTimes(1);
   });
 
   it("refreshes Claude Code CLI credentials after the TTL window", async () => {
-    execSyncMock.mockImplementation(() =>
+    execFileSyncMock.mockImplementation(() =>
       JSON.stringify({
         claudeAiOauth: {
           accessToken: `token-${Date.now()}`,
@@ -228,7 +314,7 @@ describe("cli credentials", () => {
       allowKeychainPrompt: true,
       ttlMs: 15 * 60 * 1000,
       platform: "darwin",
-      execSync: execSyncMock,
+      execFileSync: execFileSyncMock,
     });
 
     vi.advanceTimersByTime(15 * 60 * 1000 + 1);
@@ -237,12 +323,12 @@ describe("cli credentials", () => {
       allowKeychainPrompt: true,
       ttlMs: 15 * 60 * 1000,
       platform: "darwin",
-      execSync: execSyncMock,
+      execFileSync: execFileSyncMock,
     });
 
     expect(first).toBeTruthy();
     expect(second).toBeTruthy();
-    expect(execSyncMock).toHaveBeenCalledTimes(2);
+    expect(execFileSyncMock).toHaveBeenCalledTimes(2);
   });
 
   it("reads Codex credentials from keychain when available", async () => {
@@ -251,10 +337,12 @@ describe("cli credentials", () => {
 
     const accountHash = "cli|";
 
-    execSyncMock.mockImplementation((command: unknown) => {
-      const cmd = String(command);
-      expect(cmd).toContain("Codex Auth");
-      expect(cmd).toContain(accountHash);
+    execFileSyncMock.mockImplementation((file: unknown, args: unknown) => {
+      const binary = String(file);
+      const argv = Array.isArray(args) ? args.map(String) : [];
+      expect(binary).toBe("security");
+      expect(argv).toContain("Codex Auth");
+      expect(argv.some((arg) => arg.includes(accountHash))).toBe(true);
       return JSON.stringify({
         tokens: {
           access_token: "keychain-access",
@@ -265,7 +353,7 @@ describe("cli credentials", () => {
     });
 
     const { readCodexCliCredentials } = await import("./cli-credentials.js");
-    const creds = readCodexCliCredentials({ platform: "darwin", execSync: execSyncMock });
+    const creds = readCodexCliCredentials({ platform: "darwin", execFileSync: execFileSyncMock });
 
     expect(creds).toMatchObject({
       access: "keychain-access",
@@ -277,7 +365,7 @@ describe("cli credentials", () => {
   it("falls back to Codex auth.json when keychain is unavailable", async () => {
     const tempHome = fs.mkdtempSync(path.join(os.tmpdir(), "openclaw-codex-"));
     process.env.CODEX_HOME = tempHome;
-    execSyncMock.mockImplementation(() => {
+    execFileSyncMock.mockImplementation(() => {
       throw new Error("not found");
     });
 
@@ -295,7 +383,7 @@ describe("cli credentials", () => {
     );
 
     const { readCodexCliCredentials } = await import("./cli-credentials.js");
-    const creds = readCodexCliCredentials({ execSync: execSyncMock });
+    const creds = readCodexCliCredentials({ execFileSync: execFileSyncMock });
 
     expect(creds).toMatchObject({
       access: "file-access",
