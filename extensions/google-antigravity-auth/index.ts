@@ -1,5 +1,6 @@
 import { createHash, randomBytes } from "node:crypto";
 import { createServer } from "node:http";
+import net from "node:net";
 import {
   buildOauthProviderAuthResult,
   emptyPluginConfigSchema,
@@ -14,7 +15,6 @@ const CLIENT_ID = decode(
   "MTA3MTAwNjA2MDU5MS10bWhzc2luMmgyMWxjcmUyMzV2dG9sb2poNGc0MDNlcC5hcHBzLmdvb2dsZXVzZXJjb250ZW50LmNvbQ==",
 );
 const CLIENT_SECRET = decode("R09DU1BYLUs1OEZXUjQ4NkxkTEoxbUxCOHNYQzR6NnFEQWY=");
-const REDIRECT_URI = "http://localhost:51121/oauth-callback";
 const AUTH_URL = "https://accounts.google.com/o/oauth2/v2/auth";
 const TOKEN_URL = "https://oauth2.googleapis.com/token";
 const DEFAULT_PROJECT_ID = "rising-fact-p41fc";
@@ -53,15 +53,36 @@ function generatePkce(): { verifier: string; challenge: string } {
   return { verifier, challenge };
 }
 
+function isLoopbackHost(host: string): boolean {
+  if (!host) {
+    return false;
+  }
+  const h = host.trim().toLowerCase();
+  if (h === "localhost") {
+    return true;
+  }
+  // Handle bracketed IPv6 addresses like [::1]
+  const unbracket = h.startsWith("[") && h.endsWith("]") ? h.slice(1, -1) : h;
+  // Check for IPv4 loopback (127.x.x.x)
+  if (unbracket === "127.0.0.1" || unbracket.startsWith("127.")) {
+    return true;
+  }
+  // Check for IPv6 loopback (::1 or ::ffff:127.x.x.x)
+  if (unbracket === "::1" || unbracket.startsWith("::ffff:127.")) {
+    return true;
+  }
+  return false;
+}
+
 function shouldUseManualOAuthFlow(isRemote: boolean): boolean {
   return isRemote || isWSL2Sync();
 }
 
-function buildAuthUrl(params: { challenge: string; state: string }): string {
+function buildAuthUrl(params: { challenge: string; state: string; redirectUri: string }): string {
   const url = new URL(AUTH_URL);
   url.searchParams.set("client_id", CLIENT_ID);
   url.searchParams.set("response_type", "code");
-  url.searchParams.set("redirect_uri", REDIRECT_URI);
+  url.searchParams.set("redirect_uri", params.redirectUri);
   url.searchParams.set("scope", SCOPES.join(" "));
   url.searchParams.set("code_challenge", params.challenge);
   url.searchParams.set("code_challenge_method", "S256");
@@ -93,9 +114,12 @@ function parseCallbackInput(input: string): { code: string; state: string } | { 
   }
 }
 
-async function startCallbackServer(params: { timeoutMs: number }) {
-  const redirect = new URL(REDIRECT_URI);
-  const port = redirect.port ? Number(redirect.port) : 51121;
+async function startCallbackServer(params: { timeoutMs: number; expectedState: string }): Promise<{
+  redirectUri: string;
+  waitForCallback: () => Promise<URL>;
+  close: () => Promise<void>;
+}> {
+  const pathname = "/oauth-callback";
 
   let settled = false;
   let resolveCallback: (url: URL) => void;
@@ -130,10 +154,18 @@ async function startCallbackServer(params: { timeoutMs: number }) {
       return;
     }
 
-    const url = new URL(request.url, `${redirect.protocol}//${redirect.host}`);
-    if (url.pathname !== redirect.pathname) {
+    const url = new URL(request.url, "http://127.0.0.1");
+    if (url.pathname !== pathname) {
       response.writeHead(404, { "Content-Type": "text/plain" });
       response.end("Not found");
+      return;
+    }
+
+    // Validate state parameter to prevent CSRF attacks
+    const state = url.searchParams.get("state");
+    if (!state || state !== params.expectedState) {
+      response.writeHead(400, { "Content-Type": "text/plain" });
+      response.end("Invalid state");
       return;
     }
 
@@ -146,19 +178,30 @@ async function startCallbackServer(params: { timeoutMs: number }) {
     });
   });
 
+  // Dynamic port binding - let OS choose an available port
   await new Promise<void>((resolve, reject) => {
     const onError = (err: Error) => {
       server.off("error", onError);
       reject(err);
     };
     server.once("error", onError);
-    server.listen(port, "127.0.0.1", () => {
+    // Use 127.0.0.1 (loopback IPv4) instead of localhost for security
+    // Port 0 tells OS to assign any available port
+    server.listen(0, "127.0.0.1", () => {
       server.off("error", onError);
       resolve();
     });
   });
 
+  const addr = server.address();
+  if (!addr || typeof addr === "string") {
+    throw new Error("Failed to get server address");
+  }
+
+  const redirectUri = `http://127.0.0.1:${addr.port}${pathname}`;
+
   return {
+    redirectUri,
     waitForCallback: () => callbackPromise,
     close: () =>
       new Promise<void>((resolve) => {
@@ -170,6 +213,7 @@ async function startCallbackServer(params: { timeoutMs: number }) {
 async function exchangeCode(params: {
   code: string;
   verifier: string;
+  redirectUri: string;
 }): Promise<{ access: string; refresh: string; expires: number }> {
   const response = await fetch(TOKEN_URL, {
     method: "POST",
@@ -179,7 +223,7 @@ async function exchangeCode(params: {
       client_secret: CLIENT_SECRET,
       code: params.code,
       grant_type: "authorization_code",
-      redirect_uri: REDIRECT_URI,
+      redirect_uri: params.redirectUri,
       code_verifier: params.verifier,
     }),
   });
@@ -293,17 +337,24 @@ async function loginAntigravity(params: {
 }> {
   const { verifier, challenge } = generatePkce();
   const state = randomBytes(16).toString("hex");
-  const authUrl = buildAuthUrl({ challenge, state });
 
   let callbackServer: Awaited<ReturnType<typeof startCallbackServer>> | null = null;
+  let redirectUri = "http://localhost:51121/oauth-callback"; // Fallback for manual flow
   const needsManual = shouldUseManualOAuthFlow(params.isRemote);
+
   if (!needsManual) {
     try {
-      callbackServer = await startCallbackServer({ timeoutMs: 5 * 60 * 1000 });
+      callbackServer = await startCallbackServer({
+        timeoutMs: 5 * 60 * 1000,
+        expectedState: state,
+      });
+      redirectUri = callbackServer.redirectUri;
     } catch {
       callbackServer = null;
     }
   }
+
+  const authUrl = buildAuthUrl({ challenge, state, redirectUri });
 
   if (!callbackServer) {
     await params.note(
@@ -312,7 +363,7 @@ async function loginAntigravity(params: {
         "After signing in, copy the full redirect URL and paste it back here.",
         "",
         `Auth URL: ${authUrl}`,
-        `Redirect URI: ${REDIRECT_URI}`,
+        `Redirect URI: ${redirectUri}`,
       ].join("\n"),
       "Google Antigravity OAuth",
     );
@@ -360,7 +411,7 @@ async function loginAntigravity(params: {
   }
 
   params.progress.update("Exchanging code for tokens…");
-  const tokens = await exchangeCode({ code, verifier });
+  const tokens = await exchangeCode({ code, verifier, redirectUri });
   const email = await fetchUserEmail(tokens.access);
   const projectId = await fetchProjectId(tokens.access);
 
@@ -383,7 +434,7 @@ const antigravityPlugin = {
         {
           id: "oauth",
           label: "Google OAuth",
-          hint: "PKCE + localhost callback",
+          hint: "PKCE + dynamic port + state validation",
           kind: "oauth",
           run: async (ctx: ProviderAuthContext) => {
             const spin = ctx.prompter.progress("Starting Antigravity OAuth…");
